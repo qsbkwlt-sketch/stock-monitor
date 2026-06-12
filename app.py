@@ -367,6 +367,11 @@ def render_longhold_backtest():
             "估值CSV（可选：date, code, pe_ttm, pb, dividend_yield）",
             type=["csv"],
         )
+        bundled_valuation = Path("valuation.csv")
+        if valuation_file is None and bundled_valuation.exists():
+            st.caption("已检测到仓库内置 valuation.csv，将自动使用真实 PE/PB 分位。")
+        elif valuation_file is None:
+            st.caption("未检测到 valuation.csv；不上传时将使用价格分位代理估值。")
         use_market_filter = st.checkbox("启用沪深300大盘过滤", value=False)
 
     if st.button("运行龙头回测", type="primary", use_container_width=True):
@@ -376,6 +381,8 @@ def render_longhold_backtest():
             tmp_dir.mkdir(exist_ok=True)
             tmp_val_path = tmp_dir / "valuation_uploaded.csv"
             tmp_val_path.write_bytes(valuation_file.getvalue())
+        elif Path("valuation.csv").exists():
+            tmp_val_path = Path("valuation.csv")
 
         with st.spinner("正在拉取数据并回测..."):
             try:
