@@ -11,8 +11,6 @@ from plotly.subplots import make_subplots
 from datetime import date, timedelta
 from pathlib import Path
 
-from leader_longhold_backtest import LEADERS, run_longhold_analysis
-
 # ─── 页面配置 ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="A股信号监控",
@@ -25,12 +23,16 @@ st.set_page_config(
 PRESETS = [
     ("紫金", "601899"), ("洛阳钼", "603993"), ("宁德", "300750"),
     ("长江电", "600900"), ("招商银", "600036"), ("小米",  "1810"),
+    ("腾讯", "0700"), ("美团", "3690"),
+    ("阿里", "BABA"), ("拼多多", "PDD"), ("京东", "JD"),
 ]
 
 # ─── 代码 → Yahoo Ticker ─────────────────────────────────────────────────────
 def to_ticker(code: str) -> str:
     code = code.strip().upper()
     if "." in code:
+        return code
+    if code.isalpha():
         return code
     if len(code) <= 4:                        # 港股
         return code.zfill(4) + ".HK"
@@ -40,8 +42,10 @@ def to_ticker(code: str) -> str:
 
 def guess_name(code: str) -> str:
     known = {"601899": "紫金矿业", "603993": "洛阳钼业", "300750": "宁德时代",
-             "600900": "长江电力", "600036": "招商银行", "1810":   "小米集团"}
-    return known.get(code.strip(), code)
+             "600900": "长江电力", "600036": "招商银行", "1810":   "小米集团",
+             "0700": "腾讯控股", "700": "腾讯控股", "3690": "美团",
+             "BABA": "阿里巴巴", "PDD": "拼多多", "JD": "京东"}
+    return known.get(code.strip().upper(), code)
 
 # ─── 数据获取 ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -61,6 +65,48 @@ def get_data(ticker: str, period: str = "3y") -> pd.DataFrame | None:
         df["pct"]    = df["close"].pct_change() * 100
         df = df[["date","open","high","low","close","volume","amount","pct"]]
         return df.dropna(subset=["close"]).reset_index(drop=True)
+    except Exception:
+        return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_pe_percentile(ticker: str, period: str = "5y") -> dict | None:
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period=period, interval="1d", auto_adjust=True)
+        earnings = tk.get_earnings_dates(limit=32)
+        if hist.empty or earnings is None or earnings.empty:
+            return None
+        hist = hist.reset_index()
+        hist["date"] = pd.to_datetime(hist["Date"]).dt.tz_localize(None)
+        hist = hist[["date", "Close"]].rename(columns={"Close": "close"}).dropna()
+
+        eps_col = None
+        for col in ["Reported EPS", "reportedEPS"]:
+            if col in earnings.columns:
+                eps_col = col
+                break
+        if eps_col is None:
+            return None
+        eps = earnings.reset_index()
+        date_col = "Earnings Date" if "Earnings Date" in eps.columns else eps.columns[0]
+        eps["date"] = pd.to_datetime(eps[date_col]).dt.tz_localize(None)
+        eps["eps"] = pd.to_numeric(eps[eps_col], errors="coerce")
+        eps = eps[["date", "eps"]].dropna().sort_values("date")
+        if len(eps) < 4:
+            return None
+        eps["eps_ttm"] = eps["eps"].rolling(4).sum()
+        merged = pd.merge_asof(hist.sort_values("date"), eps[["date", "eps_ttm"]], on="date", direction="backward")
+        merged = merged.dropna(subset=["eps_ttm"])
+        merged = merged[merged["eps_ttm"] > 0].copy()
+        if len(merged) < 60:
+            return None
+        merged["pe_ttm"] = merged["close"] / merged["eps_ttm"]
+        merged = merged.replace([float("inf"), -float("inf")], pd.NA).dropna(subset=["pe_ttm"])
+        if merged.empty:
+            return None
+        current = float(merged["pe_ttm"].iloc[-1])
+        pct = float((merged["pe_ttm"] <= current).mean() * 100)
+        return {"pe_ttm": current, "pe_pct": pct, "samples": len(merged)}
     except Exception:
         return None
 
@@ -212,7 +258,7 @@ def make_chart(df: pd.DataFrame, name: str) -> go.Figure:
     fig.add_trace(go.Candlestick(
         x=tail["date"], open=tail["open"], high=tail["high"],
         low=tail["low"], close=tail["close"],
-        increasing_line_color="#00d68f", decreasing_line_color="#ff3d71",
+        increasing_line_color="#d93025", decreasing_line_color="#188038",
         name="K线", showlegend=False), row=1, col=1)
 
     fig.add_trace(go.Scatter(x=tail["date"], y=s20, name="MA20",
@@ -221,7 +267,7 @@ def make_chart(df: pd.DataFrame, name: str) -> go.Figure:
         line=dict(color="#4d9fff", width=1.5)), row=1, col=1)
 
     # Volume bars
-    colors = ["#00d68f" if c >= o else "#ff3d71"
+    colors = ["#d93025" if c >= o else "#188038"
               for c, o in zip(tail["close"], tail["open"])]
     fig.add_trace(go.Bar(x=tail["date"], y=tail["volume"], name="成交量",
         marker_color=colors, showlegend=False), row=2, col=1)
@@ -233,11 +279,11 @@ def make_chart(df: pd.DataFrame, name: str) -> go.Figure:
         xaxis_rangeslider_visible=False,
         height=480, margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(orientation="h", y=1.02, x=0),
-        plot_bgcolor="#0c1220", paper_bgcolor="#0c1220",
-        font_color="#c0d0e0",
+        plot_bgcolor="#ffffff", paper_bgcolor="#ffffff",
+        font_color="#202124",
     )
-    fig.update_xaxes(gridcolor="#1a2535", showgrid=True)
-    fig.update_yaxes(gridcolor="#1a2535", showgrid=True)
+    fig.update_xaxes(gridcolor="#e8eaed", showgrid=True)
+    fig.update_yaxes(gridcolor="#e8eaed", showgrid=True)
     return fig
 
 # ─── 权益曲线 ─────────────────────────────────────────────────────────────────
@@ -245,19 +291,19 @@ def make_equity_chart(equity: list) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         y=equity, mode="lines+markers",
-        line=dict(color="#00d68f", width=2),
+        line=dict(color="#d93025", width=2),
         marker=dict(size=5),
-        fill="tozeroy", fillcolor="rgba(0,214,143,0.1)",
+        fill="tozeroy", fillcolor="rgba(217,48,37,0.08)",
         name="累计收益%"))
     fig.add_hline(y=0, line_dash="dash", line_color="#555")
     fig.update_layout(
         title="权益曲线（每笔累计收益%）",
         height=260, margin=dict(l=10, r=10, t=40, b=10),
-        plot_bgcolor="#0c1220", paper_bgcolor="#0c1220",
-        font_color="#c0d0e0", showlegend=False,
+        plot_bgcolor="#ffffff", paper_bgcolor="#ffffff",
+        font_color="#202124", showlegend=False,
     )
-    fig.update_xaxes(gridcolor="#1a2535")
-    fig.update_yaxes(gridcolor="#1a2535")
+    fig.update_xaxes(gridcolor="#e8eaed")
+    fig.update_yaxes(gridcolor="#e8eaed")
     return fig
 
 def make_longhold_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
@@ -268,26 +314,41 @@ def make_longhold_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
     plot_df["ret"] = (plot_df["equity"] - 1) * 100
     fig.add_trace(go.Scatter(
         x=plot_df["date"], y=plot_df["ret"], mode="lines",
-        line=dict(color="#00d68f", width=2),
-        fill="tozeroy", fillcolor="rgba(0,214,143,0.10)",
+        line=dict(color="#d93025", width=2),
+        fill="tozeroy", fillcolor="rgba(217,48,37,0.08)",
         name="策略收益%"))
     fig.add_hline(y=0, line_dash="dash", line_color="#555")
     fig.update_layout(
         title="龙头长期策略权益曲线",
         height=320, margin=dict(l=10, r=10, t=40, b=10),
-        plot_bgcolor="#0c1220", paper_bgcolor="#0c1220",
-        font_color="#c0d0e0", showlegend=False,
+        plot_bgcolor="#ffffff", paper_bgcolor="#ffffff",
+        font_color="#202124", showlegend=False,
     )
-    fig.update_xaxes(gridcolor="#1a2535")
-    fig.update_yaxes(gridcolor="#1a2535", ticksuffix="%")
+    fig.update_xaxes(gridcolor="#e8eaed")
+    fig.update_yaxes(gridcolor="#e8eaed", ticksuffix="%")
     return fig
 
+@st.cache_resource(show_spinner=False)
+def load_longhold_module():
+    from leader_longhold_backtest import LEADERS, run_longhold_analysis
+    return LEADERS, run_longhold_analysis
+
 def render_longhold_backtest():
+    try:
+        leaders, run_analysis = load_longhold_module()
+    except Exception as exc:
+        st.error(
+            "无法加载龙头长期回测模块。请确认 GitHub 仓库中包含 "
+            "`leader_longhold_backtest.py`，且 requirements.txt 已包含 numpy。"
+        )
+        st.exception(exc)
+        return
+
     st.title("🏛️ 龙头长期回测")
     st.caption("多因子择机买入 · 核心持有 · 极端估值/严重破位退出")
 
     st.markdown("**股票池**")
-    st.caption(" · ".join([f"{code} {name}" for code, name in LEADERS.items()]))
+    st.caption(" · ".join([f"{code} {name}" for code, name in leaders.items()]))
 
     with st.expander("参数", expanded=False):
         c1, c2 = st.columns(2)
@@ -318,7 +379,7 @@ def render_longhold_backtest():
 
         with st.spinner("正在拉取数据并回测..."):
             try:
-                result = run_longhold_analysis(
+                result = run_analysis(
                     start=start,
                     end=end,
                     valuation_csv=str(tmp_val_path) if tmp_val_path else None,
@@ -364,7 +425,7 @@ def render_longhold_backtest():
     for col, label, value in metrics:
         col.markdown(f"""<div class="metric-box">
             <div style="font-size:10px;color:#888">{label}</div>
-            <div style="color:#c0d0e0;font-weight:700;font-size:16px">{value}</div>
+            <div style="color:#202124;font-weight:700;font-size:16px">{value}</div>
         </div>""", unsafe_allow_html=True)
 
     st.caption(
@@ -381,6 +442,8 @@ def render_longhold_backtest():
     latest_date = scores["date"].max() if not scores.empty else None
     if latest_date:
         latest_scores = scores[scores["date"] == latest_date].sort_values("score", ascending=False)
+        latest_scores = latest_scores.copy()
+        latest_scores["notes"] = latest_scores["notes"].map(translate_signal_text)
         st.markdown(f"**最新信号（{latest_date}）**")
         st.dataframe(
             latest_scores[["code", "name", "score", "valuation_pct", "notes"]],
@@ -391,29 +454,70 @@ def render_longhold_backtest():
         if trades.empty:
             st.caption("无交易")
         else:
-            st.dataframe(trades, use_container_width=True, hide_index=True)
+            show_trades = trades.copy()
+            show_trades["side"] = show_trades["side"].map({"BUY": "买入", "SELL": "卖出"}).fillna(show_trades["side"])
+            show_trades["reason"] = show_trades["reason"].map(translate_signal_text)
+            st.dataframe(show_trades, use_container_width=True, hide_index=True)
 
     with st.expander("估值来源", expanded=False):
         st.dataframe(sources, use_container_width=True, hide_index=True)
 
     st.caption("数据仅供参考 · 不构成投资建议 · 历史表现不代表未来收益")
 
+SIGNAL_TEXT_MAP = {
+    "market_weak": "大盘偏弱",
+    "long_trend_up": "长期趋势向上",
+    "trend_neutral": "趋势中性",
+    "reasonable_pullback": "合理回撤",
+    "deep_pullback": "深度回撤",
+    "shallow_pullback": "浅回撤",
+    "trend_continuation": "趋势延续",
+    "valuation_low": "估值偏低",
+    "valuation_fair": "估值合理",
+    "valuation_acceptable": "估值可接受",
+    "price_percentile_low": "价格分位偏低",
+    "price_percentile_fair": "价格分位合理",
+    "price_percentile_acceptable": "价格分位可接受",
+    "relative_strength_low_vol": "相对强且波动较低",
+    "relative_strength_ok": "相对强度尚可",
+    "overheated_penalty": "过热扣分",
+    "earnings_window_no_new_buy": "财报窗口不新开仓",
+    "fallback_ranked_entry": "候选补位买入",
+    "trend_hard_exit": "严重破位退出",
+    "valuation_extreme_exit": "估值极端退出",
+}
+
+def translate_signal_text(text):
+    if pd.isna(text):
+        return text
+    parts = str(text).split("|")
+    translated = []
+    for part in parts:
+        if part.startswith("valuation_high_trim_"):
+            translated.append("估值高位减仓")
+        elif part.startswith("core_trend_confirmed_trim_"):
+            translated.append("长期趋势转弱减仓")
+        elif part.startswith("trend_break_trim_"):
+            translated.append("趋势破位减仓")
+        else:
+            translated.append(SIGNAL_TEXT_MAP.get(part, part))
+    return " + ".join(translated)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-body { background-color: #080c18; }
-.stApp { background-color: #080c18; }
-.signal-buy   { background:#00d68f22; border:1px solid #00d68f;
+.stApp { background-color: #f8fafc; color:#202124; }
+.signal-buy   { background:#d9302514; border:1px solid #d93025;
                 border-radius:8px; padding:12px; text-align:center; }
-.signal-watch { background:#f5c40022; border:1px solid #f5c400;
+.signal-watch { background:#fbbc041c; border:1px solid #fbbc04;
                 border-radius:8px; padding:12px; text-align:center; }
-.signal-hold  { background:#4d9fff22; border:1px solid #4d9fff;
+.signal-hold  { background:#1a73e814; border:1px solid #1a73e8;
                 border-radius:8px; padding:12px; text-align:center; }
-.signal-stop  { background:#ff3d7122; border:1px solid #ff3d71;
+.signal-stop  { background:#18803814; border:1px solid #188038;
                 border-radius:8px; padding:12px; text-align:center; }
-.metric-box   { background:#0c1220; border:1px solid #1a2535;
+.metric-box   { background:#ffffff; border:1px solid #e0e3e7;
                 border-radius:8px; padding:10px; text-align:center; }
 </style>
 """, unsafe_allow_html=True)
@@ -464,7 +568,8 @@ if code_input:
         st.error(f"❌ 无法获取 {ticker} 数据，请检查代码是否正确\n\n"
                  f"上交所：6位数字（如 601899）\n"
                  f"深交所：6位数字（如 300750）\n"
-                 f"港  股：4位数字（如 1810）")
+                 f"港  股：4位数字（如 0700 / 3690）\n"
+                 f"美  股：英文代码（如 BABA / PDD / JD）")
         st.stop()
 
     ind = compute_signal(df)
@@ -477,16 +582,16 @@ if code_input:
     st.divider()
     sig_class = {"BUY":"buy","WATCH":"watch","HOLD":"hold","STOP":"stop"}.get(ind["signal"],"hold")
     sig_label = {"BUY":"买  入","WATCH":"观  察","HOLD":"持  有","STOP":"⚡ 止损"}.get(ind["signal"])
-    sig_color = {"BUY":"#00d68f","WATCH":"#f5c400","HOLD":"#4d9fff","STOP":"#ff3d71"}.get(ind["signal"])
+    sig_color = {"BUY":"#d93025","WATCH":"#b06000","HOLD":"#1a73e8","STOP":"#188038"}.get(ind["signal"])
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        pct_color = "green" if ind["pct"] >= 0 else "red"
+        pct_color = "#d93025" if ind["pct"] >= 0 else "#188038"
         pct_str = f"+{ind['pct']:.2f}%" if ind["pct"] >= 0 else f"{ind['pct']:.2f}%"
         st.markdown(f"### {name} `{code_input}`")
         st.markdown(f"**T-1 {ind['date']}**")
         st.markdown(f"## ¥{ind['close']:.2f}  "
-                    f"<span style='color:{'#00d68f' if ind['pct']>=0 else '#ff3d71'}'>{pct_str}</span>",
+                    f"<span style='color:{pct_color}'>{pct_str}</span>",
                     unsafe_allow_html=True)
         st.caption(f"开 {ind['open']:.2f}  高 {ind['high']:.2f}  低 {ind['low']:.2f}")
     with c2:
@@ -499,15 +604,19 @@ if code_input:
     vr = ind["vol_ratio"]
     vr_str = f"{vr:.2f}x" if vr else "—"
     diff_str = f"+{ind['diff_ma20']:.1f}%" if ind["diff_ma20"] >= 0 else f"{ind['diff_ma20']:.1f}%"
+    pe_info = get_pe_percentile(ticker)
+    pe_str = f"{pe_info['pe_ttm']:.1f}x" if pe_info else "—"
+    pe_pct_str = f"{pe_info['pe_pct']:.0f}%" if pe_info else "—"
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     for col, label, value, color_cond in [
         (m1, "量比",   vr_str,                 vr and vr >= 1.5),
         (m2, "20日均", f"¥{ind['ma20']:.2f}",  False),
         (m3, "偏离",   diff_str,               ind["diff_ma20"] >= 0),
         (m4, "60日均", f"¥{ind['ma60']:.2f}",  False),
+        (m5, "PE分位", f"{pe_str} / {pe_pct_str}", pe_info and pe_info["pe_pct"] <= 35),
     ]:
-        c = "#00d68f" if color_cond else ("#ff3d71" if not color_cond and label=="偏离" and ind["diff_ma20"]<0 else "#c0d0e0")
+        c = "#d93025" if color_cond else ("#188038" if not color_cond and label=="偏离" and ind["diff_ma20"]<0 else "#202124")
         col.markdown(f"""<div class="metric-box">
             <div style="font-size:10px;color:#888">{label}</div>
             <div style="color:{c};font-weight:600">{value}</div>
@@ -537,7 +646,7 @@ if code_input:
             (r4, "最大回撤", f"-{m['max_dd']}%",    m["max_dd"] < 15),
             (r5, "盈亏比",   str(m["pf"]),           m["pf"] >= 1.5),
         ]:
-            c = "#00d68f" if good else ("#ff3d71" if good is False else "#c0d0e0")
+            c = "#d93025" if good else ("#188038" if good is False else "#202124")
             col.markdown(f"""<div class="metric-box">
                 <div style="font-size:10px;color:#888">{label}</div>
                 <div style="color:{c};font-weight:700;font-size:16px">{value}</div>
@@ -561,7 +670,7 @@ if code_input:
             tdf = pd.DataFrame(rows)
             # Color the pnl column
             def color_pnl(val):
-                c = "#00d68f" if "+" in str(val) and val != "+0.0%" else "#ff3d71"
+                c = "#d93025" if "+" in str(val) and val != "+0.0%" else "#188038"
                 return f"color: {c}"
             st.dataframe(
                 tdf.style.map(color_pnl, subset=["盈亏"]),
