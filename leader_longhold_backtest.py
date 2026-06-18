@@ -684,6 +684,96 @@ def run(args: argparse.Namespace) -> None:
         print(f"  {path}")
 
 
+def run_longhold_analysis(
+    start: str = "2015-01-01",
+    end: Optional[str] = None,
+    valuation_csv: Optional[str] = None,
+    cache_dir: str = "data_cache",
+    no_download: bool = False,
+    signal_frequency: str = "monthly",
+    max_positions: int = 4,
+    min_positions: int = 0,
+    buy_score: float = 65.0,
+    fallback_score: float = 60.0,
+    avoid_earnings: bool = True,
+    avoid_earnings_months: str = "4,8,10",
+    use_market_filter: bool = False,
+    core_hold: bool = True,
+    core_trend_trim: float = 0.0,
+    valuation_high_pct: float = 0.95,
+    valuation_extreme_pct: float = 0.99,
+    valuation_reset_pct: float = 0.75,
+    valuation_trim: float = 0.20,
+    buy_commission: float = 0.0003,
+    sell_commission: float = 0.0003,
+    stamp_tax: float = 0.0005,
+    slippage: float = 0.001,
+) -> dict:
+    args = argparse.Namespace(
+        start=start,
+        end=end,
+        cache_dir=cache_dir,
+        output_dir="",
+        valuation_csv=valuation_csv,
+        no_download=no_download,
+        signal_frequency=signal_frequency,
+        max_positions=max_positions,
+        min_positions=min_positions,
+        buy_score=buy_score,
+        fallback_score=fallback_score,
+        avoid_earnings=avoid_earnings,
+        avoid_earnings_months=avoid_earnings_months,
+        use_market_filter=use_market_filter,
+        core_hold=core_hold,
+        core_trend_trim=core_trend_trim,
+        valuation_high_pct=valuation_high_pct,
+        valuation_extreme_pct=valuation_extreme_pct,
+        valuation_reset_pct=valuation_reset_pct,
+        valuation_trim=valuation_trim,
+        buy_commission=buy_commission,
+        sell_commission=sell_commission,
+        stamp_tax=stamp_tax,
+        slippage=slippage,
+    )
+    cost = CostModel(
+        buy_commission=buy_commission,
+        sell_commission=sell_commission,
+        stamp_tax=stamp_tax,
+        slippage=slippage,
+    )
+    cache_path = Path(cache_dir)
+    valuations = load_valuation(valuation_csv)
+    market = download_or_load(MARKET_INDEX, start, end, cache_path, no_download)
+    market = add_price_indicators(market)
+
+    data_by_code = {}
+    valuation_sources = {}
+    for code in LEADERS:
+        df = download_or_load(to_yahoo_ticker(code), start, end, cache_path, no_download)
+        df = add_price_indicators(df)
+        df, source = attach_valuation(code, df, valuations)
+        df = merge_market(df, market)
+        required = ["ma250", "mkt_ma250"] if use_market_filter else ["ma250"]
+        data_by_code[code] = df.dropna(subset=required).reset_index(drop=True)
+        valuation_sources[code] = source
+
+    trades, equity, scores = run_backtest(data_by_code, market, args, cost)
+    summary = summarize(equity, trades)
+    if summary:
+        summary.update(buy_hold_benchmark(data_by_code, summary["start"], summary["end"]))
+
+    sources = pd.DataFrame(
+        [{"code": c, "name": LEADERS[c], "valuation_source": s} for c, s in valuation_sources.items()]
+    )
+    return {
+        "summary": pd.DataFrame([summary]) if summary else pd.DataFrame(),
+        "trades": trades,
+        "equity": equity,
+        "scores": scores,
+        "sources": sources,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Low-frequency multi-factor leader backtest.")
     parser.add_argument("--start", default="2015-01-01")
