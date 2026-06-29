@@ -345,6 +345,30 @@ def load_longhold_module():
     from leader_longhold_backtest import LEADERS, run_longhold_analysis
     return LEADERS, run_longhold_analysis
 
+LEADER_CN_NAMES = {
+    "600900": "长江电力",
+    "600036": "招商银行",
+    "601318": "中国平安",
+    "600519": "贵州茅台",
+    "000333": "美的集团",
+    "600941": "中国移动",
+    "601088": "中国神华",
+    "600030": "中信证券",
+}
+
+def leader_cn_name(code, fallback=""):
+    return LEADER_CN_NAMES.get(str(code), fallback)
+
+def latest_longhold_signal(row, buy_codes):
+    notes = str(row.get("notes", ""))
+    if row.get("trade_side") == "SELL":
+        return "卖出"
+    if row.get("trade_side") == "BUY":
+        return "买入"
+    if "earnings_window_no_new_buy" in notes:
+        return "观望"
+    return "买入" if str(row.get("code")) in buy_codes else "观望"
+
 def render_longhold_backtest():
     try:
         leaders, run_analysis = load_longhold_module()
@@ -360,7 +384,7 @@ def render_longhold_backtest():
     st.caption("多因子择机买入 · 核心持有 · 极端估值/严重破位退出")
 
     st.markdown("**股票池**")
-    st.caption(" · ".join([f"{code} {name}" for code, name in leaders.items()]))
+    st.caption(" · ".join([f"{code} {leader_cn_name(code, name)}" for code, name in leaders.items()]))
 
     with st.expander("参数", expanded=False):
         c1, c2 = st.columns(2)
@@ -369,6 +393,13 @@ def render_longhold_backtest():
             end = st.text_input("结束日期", str(date.today()))
             freq = st.selectbox("信号频率", ["monthly", "weekly", "daily"], index=0)
             max_positions = st.slider("最多持仓", 2, 8, 4)
+            display_capital = st.number_input(
+                "交易明细换算资金（元）",
+                min_value=10000,
+                max_value=10000000,
+                value=500000,
+                step=10000,
+            )
         with c2:
             buy_score = st.slider("买入分数", 50, 90, 65)
             val_high = st.slider("估值减仓分位", 80, 99, 95) / 100
@@ -455,17 +486,57 @@ def render_longhold_backtest():
     st.plotly_chart(make_longhold_equity_chart(equity), use_container_width=True)
 
     latest_holdings = equity.iloc[-1]["holdings"] if not equity.empty else ""
+    latest_holding_names = []
+    if latest_holdings:
+        latest_holding_names = [
+            f"{code} {leader_cn_name(code, code)}"
+            for code in str(latest_holdings).split(",")
+            if code
+        ]
     st.markdown("**当前持仓**")
-    st.caption(latest_holdings if latest_holdings else "无")
+    st.caption(" · ".join(latest_holding_names) if latest_holding_names else "无")
 
     latest_date = scores["date"].max() if not scores.empty else None
     if latest_date:
         latest_scores = scores[scores["date"] == latest_date].sort_values("score", ascending=False)
         latest_scores = latest_scores.copy()
+        latest_scores["trade_side"] = ""
+        if not trades.empty:
+            latest_trade_date = pd.to_datetime(latest_date)
+            recent_trades = trades.copy()
+            recent_trades["date_dt"] = pd.to_datetime(recent_trades["date"], errors="coerce")
+            recent_trades = recent_trades[recent_trades["date_dt"] >= latest_trade_date]
+            if not recent_trades.empty:
+                trade_side_map = recent_trades.drop_duplicates("code", keep="last").set_index("code")["side"]
+                latest_scores["trade_side"] = latest_scores["code"].map(trade_side_map).fillna("")
+        openable = latest_scores[
+            (latest_scores["score"] >= float(buy_score))
+            & (~latest_scores["notes"].astype(str).str.contains("earnings_window_no_new_buy", na=False))
+        ]
+        buy_codes = set(openable.head(int(max_positions))["code"].astype(str))
+        latest_scores["信号"] = latest_scores.apply(lambda row: latest_longhold_signal(row, buy_codes), axis=1)
+        buy_count = max(int((latest_scores["信号"] == "买入").sum()), 1)
+        latest_scores["建议金额(元)"] = latest_scores["信号"].map(
+            lambda signal: round(float(display_capital) / buy_count, 2) if signal == "买入" else 0.0
+        )
+        latest_scores["建议股数"] = (
+            latest_scores["建议金额(元)"] / latest_scores["close"].replace(0, pd.NA)
+        ).fillna(0).round(0).astype("Int64")
+        latest_scores["股票名称"] = latest_scores.apply(
+            lambda row: leader_cn_name(row["code"], row["name"]), axis=1
+        )
         latest_scores["notes"] = latest_scores["notes"].map(translate_signal_text)
+        latest_scores = latest_scores.rename(
+            columns={
+                "code": "代码",
+                "score": "分数",
+                "valuation_pct": "估值分位(%)",
+                "notes": "原因",
+            }
+        )
         st.markdown(f"**最新信号（{latest_date}）**")
         st.dataframe(
-            latest_scores[["code", "name", "score", "valuation_pct", "notes"]],
+            latest_scores[["信号", "代码", "股票名称", "分数", "估值分位(%)", "建议股数", "建议金额(元)", "原因"]],
             use_container_width=True, hide_index=True,
         )
 
@@ -474,12 +545,45 @@ def render_longhold_backtest():
             st.caption("无交易")
         else:
             show_trades = trades.copy()
+            show_trades["股票名称"] = show_trades.apply(
+                lambda row: leader_cn_name(row["code"], row["name"]), axis=1
+            )
+            show_trades["模拟股数"] = (show_trades["shares"] * float(display_capital)).round(0).astype("Int64")
+            show_trades["成交金额(元)"] = (
+                show_trades["shares"] * show_trades["price"] * float(display_capital)
+            ).round(2)
             show_trades["side"] = show_trades["side"].map({"BUY": "买入", "SELL": "卖出"}).fillna(show_trades["side"])
             show_trades["reason"] = show_trades["reason"].map(translate_signal_text)
-            st.dataframe(show_trades, use_container_width=True, hide_index=True)
+            show_trades = show_trades.rename(
+                columns={
+                    "date": "日期",
+                    "code": "代码",
+                    "side": "方向",
+                    "price": "成交价",
+                    "reason": "原因",
+                    "score": "分数",
+                    "valuation_pct": "估值分位(%)",
+                    "valuation_is_real": "真实估值",
+                }
+            )
+            st.caption(f"按 {float(display_capital):,.0f} 元初始资金等比例换算，未额外调整 100 股手数。")
+            st.dataframe(
+                show_trades[
+                    ["日期", "方向", "代码", "股票名称", "成交价", "模拟股数", "成交金额(元)", "分数", "估值分位(%)", "原因", "真实估值"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     with st.expander("估值来源", expanded=False):
-        st.dataframe(sources, use_container_width=True, hide_index=True)
+        show_sources = sources.copy()
+        show_sources["股票名称"] = show_sources.apply(
+            lambda row: leader_cn_name(row["code"], row["name"]), axis=1
+        )
+        show_sources = show_sources.rename(
+            columns={"code": "代码", "valuation_source": "估值来源"}
+        )
+        st.dataframe(show_sources[["代码", "股票名称", "估值来源"]], use_container_width=True, hide_index=True)
 
     st.caption("数据仅供参考 · 不构成投资建议 · 历史表现不代表未来收益")
 
