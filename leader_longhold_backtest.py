@@ -493,8 +493,6 @@ def run_backtest(
         candidates = []
         avoid_new_buy = is_earnings_avoid_month(signal_date, args)
         for code, df in data_by_code.items():
-            if code in holdings:
-                continue
             row = latest_row_on_or_before(df, signal_date)
             if row is None:
                 continue
@@ -520,6 +518,8 @@ def run_backtest(
                     "notes": "|".join(notes),
                 }
             )
+            if code in holdings:
+                continue
             if not avoid_new_buy and score >= args.fallback_score:
                 candidates.append((score, code, row, notes))
 
