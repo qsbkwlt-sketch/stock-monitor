@@ -515,9 +515,9 @@ def render_longhold_backtest():
         ]
         buy_codes = set(openable.head(int(max_positions))["code"].astype(str))
         latest_scores["信号"] = latest_scores.apply(lambda row: latest_longhold_signal(row, buy_codes), axis=1)
-        buy_count = max(int((latest_scores["信号"] == "买入").sum()), 1)
+        position_budget = float(display_capital) / max(int(max_positions), 1)
         latest_scores["建议金额(元)"] = latest_scores["信号"].map(
-            lambda signal: round(float(display_capital) / buy_count, 2) if signal == "买入" else 0.0
+            lambda signal: round(position_budget, 2) if signal == "买入" else 0.0
         )
         latest_scores["建议股数"] = (
             latest_scores["建议金额(元)"] / latest_scores["close"].replace(0, pd.NA)
@@ -534,13 +534,19 @@ def render_longhold_backtest():
                 "notes": "原因",
             }
         )
-        st.markdown(f"**最新信号（{latest_date}）**")
+        suggested_invest = latest_scores.loc[latest_scores["信号"] == "买入", "建议金额(元)"].sum()
+        suggested_cash = max(float(display_capital) - float(suggested_invest), 0.0)
+        st.markdown(f"**最新信号（空仓建议 · {latest_date}）**")
+        st.caption(
+            f"按最多持仓 {int(max_positions)} 只等份分配；触发几只买几份，"
+            f"本期建议投入 {suggested_invest:,.0f} 元，预留现金 {suggested_cash:,.0f} 元。"
+        )
         st.dataframe(
             latest_scores[["信号", "代码", "股票名称", "分数", "估值分位(%)", "建议股数", "建议金额(元)", "原因"]],
             use_container_width=True, hide_index=True,
         )
 
-    with st.expander("交易明细", expanded=False):
+    with st.expander("交易明细（历史回测成交）", expanded=False):
         if trades.empty:
             st.caption("无交易")
         else:
@@ -566,7 +572,10 @@ def render_longhold_backtest():
                     "valuation_is_real": "真实估值",
                 }
             )
-            st.caption(f"按 {float(display_capital):,.0f} 元初始资金等比例换算，未额外调整 100 股手数。")
+            st.caption(
+                f"这里是历史回测组合的实际成交，不等同于你当前空仓账户的最新建议；"
+                f"金额按 {float(display_capital):,.0f} 元初始资金等比例换算，未额外调整 100 股手数。"
+            )
             st.dataframe(
                 show_trades[
                     ["日期", "方向", "代码", "股票名称", "成交价", "模拟股数", "成交金额(元)", "分数", "估值分位(%)", "原因", "真实估值"]
