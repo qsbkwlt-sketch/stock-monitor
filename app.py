@@ -30,9 +30,6 @@ st.set_page_config(
 # ─── 常用股票快捷按钮 ─────────────────────────────────────────────────────────
 PRESETS = [
     ("紫金", "601899"), ("洛阳钼", "603993"), ("宁德", "300750"),
-    ("长江电", "600900"), ("招商银", "600036"), ("小米",  "1810"),
-    ("腾讯", "0700"), ("美团", "3690"),
-    ("阿里", "BABA"), ("拼多多", "PDD"), ("京东", "JD"),
 ]
 
 # ─── 代码 → Yahoo Ticker ─────────────────────────────────────────────────────
@@ -359,15 +356,91 @@ LEADER_CN_NAMES = {
 def leader_cn_name(code, fallback=""):
     return LEADER_CN_NAMES.get(str(code), fallback)
 
-def latest_longhold_signal(row, buy_codes):
+def latest_longhold_signal(row, buy_codes, current_holdings):
+    code = str(row.get("code"))
     notes = str(row.get("notes", ""))
-    if row.get("trade_side") == "SELL":
-        return "卖出"
-    if row.get("trade_side") == "BUY":
-        return "买入"
+    if code in current_holdings:
+        if row.get("exit_signal") == "SELL":
+            return "卖出"
+        return "持有"
     if "earnings_window_no_new_buy" in notes:
         return "观望"
     return "买入" if str(row.get("code")) in buy_codes else "观望"
+
+def longhold_signal_reason(row):
+    if row.get("信号") == "卖出" and row.get("exit_reason"):
+        return translate_signal_text(row.get("exit_reason"))
+    return translate_signal_text(row.get("notes"))
+
+ACCOUNT_COLUMNS = ["代码", "股票名称", "持仓股数", "成本价", "买入日期", "已估值减仓", "已趋势减仓"]
+
+def clean_stock_code(value):
+    code = str(value).strip().upper()
+    if code.endswith(".0"):
+        code = code[:-2]
+    if code.isdigit() and len(code) < 6:
+        code = code.zfill(6)
+    return code
+
+def empty_longhold_account(leaders):
+    return pd.DataFrame(
+        [
+            {
+                "代码": code,
+                "股票名称": leader_cn_name(code, name),
+                "持仓股数": 0,
+                "成本价": 0.0,
+                "买入日期": "",
+                "已估值减仓": False,
+                "已趋势减仓": False,
+            }
+            for code, name in leaders.items()
+        ]
+    )
+
+def normalize_longhold_account(raw_df, leaders):
+    rename_map = {
+        "code": "代码",
+        "name": "股票名称",
+        "shares": "持仓股数",
+        "entry_price": "成本价",
+        "entry_date": "买入日期",
+        "valuation_trim_done": "已估值减仓",
+        "trend_trim_done": "已趋势减仓",
+    }
+    df = raw_df.copy().rename(columns=rename_map)
+    if "代码" not in df.columns:
+        return empty_longhold_account(leaders)
+    df["代码"] = df["代码"].map(clean_stock_code)
+    df = df[df["代码"].isin(leaders.keys())].drop_duplicates("代码", keep="last")
+    base = empty_longhold_account(leaders).set_index("代码")
+    df = df.set_index("代码")
+    for col in ACCOUNT_COLUMNS:
+        if col == "代码":
+            continue
+        if col in df.columns:
+            base.loc[df.index, col] = df[col]
+    account = base.reset_index()
+    account["股票名称"] = account["代码"].map(lambda code: leader_cn_name(code, leaders[code]))
+    account["持仓股数"] = pd.to_numeric(account["持仓股数"], errors="coerce").fillna(0).clip(lower=0)
+    account["成本价"] = pd.to_numeric(account["成本价"], errors="coerce").fillna(0).clip(lower=0)
+    for col in ["已估值减仓", "已趋势减仓"]:
+        account[col] = account[col].astype(str).str.lower().isin(["true", "1", "yes", "y", "是", "已"])
+    account["买入日期"] = account["买入日期"].fillna("").astype(str)
+    return account[ACCOUNT_COLUMNS]
+
+def account_cash_from_upload(raw_df, default_cash):
+    for col in ["现金", "cash", "当前现金"]:
+        if col in raw_df.columns:
+            cash = pd.to_numeric(raw_df[col], errors="coerce").dropna()
+            if not cash.empty:
+                return float(cash.iloc[0])
+    return float(default_cash)
+
+def account_download_csv(account_df, cash):
+    out = account_df.copy()
+    out["现金"] = float(cash)
+    return out.to_csv(index=False).encode("utf-8-sig")
 
 def render_longhold_backtest():
     try:
@@ -380,7 +453,7 @@ def render_longhold_backtest():
         st.exception(exc)
         return
 
-    st.title("🏛️ 龙头长期回测")
+    st.title("🏛️ 龙头长期回测（回测基于月底操作数据）")
     st.caption("多因子择机买入 · 核心持有 · 极端估值/严重破位退出")
 
     st.markdown("**股票池**")
@@ -493,13 +566,22 @@ def render_longhold_backtest():
             for code in str(latest_holdings).split(",")
             if code
         ]
-    st.markdown("**当前持仓**")
+    st.markdown("**回测期末持仓**")
     st.caption(" · ".join(latest_holding_names) if latest_holding_names else "无")
 
     latest_date = scores["date"].max() if not scores.empty else None
     if latest_date:
         latest_scores = scores[scores["date"] == latest_date].sort_values("score", ascending=False)
         latest_scores = latest_scores.copy()
+        if "exit_signal" not in latest_scores.columns:
+            latest_scores["exit_signal"] = ""
+        if "exit_fraction" not in latest_scores.columns:
+            latest_scores["exit_fraction"] = 0.0
+        if "exit_reason" not in latest_scores.columns:
+            latest_scores["exit_reason"] = ""
+        latest_scores["exit_fraction"] = pd.to_numeric(
+            latest_scores["exit_fraction"], errors="coerce"
+        ).fillna(0.0)
         latest_scores["trade_side"] = ""
         if not trades.empty:
             latest_trade_date = pd.to_datetime(latest_date)
@@ -509,40 +591,113 @@ def render_longhold_backtest():
             if not recent_trades.empty:
                 trade_side_map = recent_trades.drop_duplicates("code", keep="last").set_index("code")["side"]
                 latest_scores["trade_side"] = latest_scores["code"].map(trade_side_map).fillna("")
+
+        with st.expander("实盘策略账户", expanded=True):
+            account_upload = st.file_uploader(
+                "导入账户CSV（可选）",
+                type=["csv"],
+                key="longhold_account_upload",
+            )
+            account_seed = empty_longhold_account(leaders)
+            uploaded_cash = float(display_capital)
+            if account_upload is not None:
+                try:
+                    uploaded_account = pd.read_csv(account_upload, dtype=str)
+                    uploaded_cash = account_cash_from_upload(uploaded_account, display_capital)
+                    account_seed = normalize_longhold_account(uploaded_account, leaders)
+                except Exception as exc:
+                    st.warning(f"账户CSV读取失败，将使用空账户模板：{exc}")
+
+            account_cash = st.number_input(
+                "当前现金（元）",
+                min_value=0.0,
+                max_value=100000000.0,
+                value=float(uploaded_cash),
+                step=10000.0,
+            )
+            edited_account = st.data_editor(
+                account_seed,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=["代码", "股票名称"],
+            )
+            account_df = normalize_longhold_account(edited_account, leaders)
+            st.download_button(
+                "下载/保存账户CSV",
+                data=account_download_csv(account_df, account_cash),
+                file_name="longhold_strategy_account.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            st.caption("Streamlit Cloud 不适合长期保存个人账户数据；建议每次操作后下载CSV，下次再导入。")
+
+        share_map = account_df.set_index("代码")["持仓股数"].to_dict()
+        latest_scores["当前股数"] = latest_scores["code"].map(share_map).fillna(0.0)
+        latest_scores["当前市值"] = latest_scores["当前股数"] * latest_scores["close"]
+        current_holdings = set(latest_scores.loc[latest_scores["当前股数"] > 0, "code"].astype(str))
+        account_equity = float(account_cash) + float(latest_scores["当前市值"].sum())
+
         openable = latest_scores[
             (latest_scores["score"] >= float(buy_score))
             & (~latest_scores["notes"].astype(str).str.contains("earnings_window_no_new_buy", na=False))
+            & (~latest_scores["code"].astype(str).isin(current_holdings))
         ]
-        buy_codes = set(openable.head(int(max_positions))["code"].astype(str))
-        latest_scores["信号"] = latest_scores.apply(lambda row: latest_longhold_signal(row, buy_codes), axis=1)
-        position_budget = float(display_capital) / max(int(max_positions), 1)
-        latest_scores["建议金额(元)"] = latest_scores["信号"].map(
-            lambda signal: round(position_budget, 2) if signal == "买入" else 0.0
+        available_slots = max(int(max_positions) - len(current_holdings), 0)
+        position_budget = account_equity / max(int(max_positions), 1)
+        buy_amounts = {}
+        remaining_cash = float(account_cash)
+        for _, row in openable.head(available_slots).iterrows():
+            invest = min(remaining_cash, position_budget)
+            if account_equity > 0 and invest < account_equity * 0.02:
+                continue
+            code = str(row["code"])
+            buy_amounts[code] = round(invest, 2)
+            remaining_cash -= invest
+        buy_codes = set(buy_amounts.keys())
+        latest_scores["信号"] = latest_scores.apply(
+            lambda row: latest_longhold_signal(row, buy_codes, current_holdings),
+            axis=1,
         )
-        latest_scores["建议股数"] = (
-            latest_scores["建议金额(元)"] / latest_scores["close"].replace(0, pd.NA)
-        ).fillna(0).round(0).astype("Int64")
+        latest_scores["建议比例(%)"] = latest_scores.apply(
+            lambda row: round(float(row.get("exit_fraction", 0.0)) * 100, 1) if row["信号"] == "卖出" else (
+                round(buy_amounts.get(str(row["code"]), 0.0) / account_equity * 100, 1) if account_equity > 0 and row["信号"] == "买入" else 0.0
+            ),
+            axis=1,
+        )
+        latest_scores["建议金额(元)"] = latest_scores.apply(
+            lambda row: buy_amounts.get(str(row["code"]), 0.0) if row["信号"] == "买入" else (
+                round(float(row["当前股数"]) * float(row["close"]) * float(row.get("exit_fraction", 0.0)), 2)
+                if row["信号"] == "卖出" else 0.0
+            ),
+            axis=1,
+        )
+        latest_scores["建议股数"] = latest_scores.apply(
+            lambda row: round(float(row["建议金额(元)"]) / float(row["close"])) if row["信号"] == "买入" and row["close"] else (
+                round(float(row["当前股数"]) * float(row.get("exit_fraction", 0.0))) if row["信号"] == "卖出" else 0
+            ),
+            axis=1,
+        ).astype("Int64")
         latest_scores["股票名称"] = latest_scores.apply(
             lambda row: leader_cn_name(row["code"], row["name"]), axis=1
         )
-        latest_scores["notes"] = latest_scores["notes"].map(translate_signal_text)
+        latest_scores["信号原因"] = latest_scores.apply(longhold_signal_reason, axis=1)
         latest_scores = latest_scores.rename(
             columns={
                 "code": "代码",
                 "score": "分数",
                 "valuation_pct": "估值分位(%)",
-                "notes": "原因",
             }
         )
         suggested_invest = latest_scores.loc[latest_scores["信号"] == "买入", "建议金额(元)"].sum()
-        suggested_cash = max(float(display_capital) - float(suggested_invest), 0.0)
-        st.markdown(f"**最新信号（空仓建议 · {latest_date}）**")
+        st.markdown(f"**最新信号（按当前持仓判断 · {latest_date}）**")
         st.caption(
-            f"按最多持仓 {int(max_positions)} 只等份分配；触发几只买几份，"
-            f"本期建议投入 {suggested_invest:,.0f} 元，预留现金 {suggested_cash:,.0f} 元。"
+            f"账户估算权益 {account_equity:,.0f} 元，现金 {float(account_cash):,.0f} 元，"
+            f"已录入持仓 {len(current_holdings)} 只，剩余可买名额 {available_slots} 个；"
+            f"本期新增建议投入 {suggested_invest:,.0f} 元。"
         )
         st.dataframe(
-            latest_scores[["信号", "代码", "股票名称", "分数", "估值分位(%)", "建议股数", "建议金额(元)", "原因"]],
+            latest_scores[["信号", "代码", "股票名称", "当前股数", "当前市值", "分数", "估值分位(%)", "建议比例(%)", "建议股数", "建议金额(元)", "信号原因"]],
             use_container_width=True, hide_index=True,
         )
 
@@ -551,6 +706,8 @@ def render_longhold_backtest():
             st.caption("无交易")
         else:
             show_trades = trades.copy()
+            if "signal" not in show_trades.columns:
+                show_trades["signal"] = show_trades["side"]
             show_trades["股票名称"] = show_trades.apply(
                 lambda row: leader_cn_name(row["code"], row["name"]), axis=1
             )
@@ -559,11 +716,13 @@ def render_longhold_backtest():
                 show_trades["shares"] * show_trades["price"] * float(display_capital)
             ).round(2)
             show_trades["side"] = show_trades["side"].map({"BUY": "买入", "SELL": "卖出"}).fillna(show_trades["side"])
+            show_trades["signal"] = show_trades["signal"].map({"BUY": "买入", "SELL": "卖出"}).fillna(show_trades["signal"])
             show_trades["reason"] = show_trades["reason"].map(translate_signal_text)
             show_trades = show_trades.rename(
                 columns={
                     "date": "日期",
                     "code": "代码",
+                    "signal": "信号",
                     "side": "方向",
                     "price": "成交价",
                     "reason": "原因",
@@ -578,7 +737,7 @@ def render_longhold_backtest():
             )
             st.dataframe(
                 show_trades[
-                    ["日期", "方向", "代码", "股票名称", "成交价", "模拟股数", "成交金额(元)", "分数", "估值分位(%)", "原因", "真实估值"]
+                    ["日期", "信号", "方向", "代码", "股票名称", "成交价", "模拟股数", "成交金额(元)", "分数", "估值分位(%)", "原因", "真实估值"]
                 ],
                 use_container_width=True,
                 hide_index=True,
