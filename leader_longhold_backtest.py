@@ -371,6 +371,23 @@ def exit_decision(row: pd.Series, holding: Holding, args: argparse.Namespace) ->
     return 0.0, ""
 
 
+def exit_signal_from_recent_rows(df: pd.DataFrame, signal_date: pd.Timestamp, args: argparse.Namespace) -> tuple[float, str]:
+    row = latest_row_on_or_before(df, signal_date)
+    if row is None or pd.isna(row["valuation_pct"]):
+        return 0.0, ""
+
+    recent = df[df["date"] <= signal_date].tail(6).copy()
+    bad_months = 0
+    for _, item in recent.iloc[::-1].iterrows():
+        if pd.isna(item.get("ma250")) or item["close"] >= item["ma250"]:
+            break
+        bad_months += 1
+
+    holding = Holding(shares=1.0, entry_date="", entry_price=float(row["close"]))
+    holding.trend_bad_months = bad_months
+    return exit_decision(row.copy(), holding, args)
+
+
 def is_earnings_avoid_month(signal_date: pd.Timestamp, args: argparse.Namespace) -> bool:
     if not args.avoid_earnings:
         return False
@@ -477,6 +494,7 @@ def run_backtest(
                     "date": exec_date.strftime("%Y-%m-%d"),
                     "code": code,
                     "name": LEADERS[code],
+                    "signal": "SELL",
                     "side": "SELL",
                     "price": round(sell_price, 4),
                     "shares": round(shares_to_sell, 6),
@@ -504,6 +522,7 @@ def run_backtest(
             row = row.copy()
             row["mkt_filter_enabled"] = args.use_market_filter
             score, notes = entry_score(row)
+            exit_frac, exit_reason = exit_signal_from_recent_rows(df, signal_date, args)
             if avoid_new_buy:
                 notes = notes + ["earnings_window_no_new_buy"]
             score_rows.append(
@@ -515,6 +534,9 @@ def run_backtest(
                     "valuation_pct": round(row["valuation_pct"] * 100, 1),
                     "valuation_is_real": bool(row.get("valuation_is_real", False)),
                     "close": round(row["close"], 3),
+                    "exit_signal": "SELL" if exit_frac > 0 else "",
+                    "exit_fraction": round(exit_frac, 4),
+                    "exit_reason": exit_reason,
                     "notes": "|".join(notes),
                 }
             )
@@ -553,6 +575,7 @@ def run_backtest(
                     "date": exec_date.strftime("%Y-%m-%d"),
                     "code": code,
                     "name": LEADERS[code],
+                    "signal": "BUY",
                     "side": "BUY",
                     "price": round(buy_price, 4),
                     "shares": round(shares, 6),
