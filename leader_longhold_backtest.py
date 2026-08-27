@@ -250,6 +250,13 @@ def attach_valuation(
 
 def merge_market(stock: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     stock = stock.copy()
+    if market is None or market.empty:
+        stock["mkt_close"] = np.nan
+        stock["mkt_ma250"] = np.nan
+        stock["mkt_ma250_slope60"] = np.nan
+        stock["mkt_ret_6m"] = np.nan
+        stock["mkt_ret_12m"] = np.nan
+        return stock
     market = market.copy()
     stock["date"] = normalize_date_series(stock["date"])
     market["date"] = normalize_date_series(market["date"])
@@ -672,8 +679,12 @@ def run(args: argparse.Namespace) -> None:
     )
 
     valuations = load_valuation(args.valuation_csv)
-    market = load_market_index(args.start, args.end, cache_dir, args.no_download)
-    market = add_price_indicators(market)
+    try:
+        market = add_price_indicators(load_market_index(args.start, args.end, cache_dir, args.no_download))
+    except Exception:
+        if args.use_market_filter:
+            raise
+        market = pd.DataFrame()
 
     data_by_code = {}
     valuation_sources = {}
@@ -782,8 +793,12 @@ def run_longhold_analysis(
     )
     cache_path = Path(cache_dir)
     valuations = load_valuation(valuation_csv)
-    market = load_market_index(start, end, cache_path, no_download)
-    market = add_price_indicators(market)
+    try:
+        market = add_price_indicators(load_market_index(start, end, cache_path, no_download))
+    except Exception:
+        if use_market_filter:
+            raise
+        market = pd.DataFrame()
 
     data_by_code = {}
     valuation_sources = {}
