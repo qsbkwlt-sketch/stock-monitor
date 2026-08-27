@@ -55,6 +55,7 @@ LEADERS = {
 }
 
 MARKET_INDEX = "000300.SS"
+MARKET_INDEX_FALLBACKS = ["000300.SS", "399300.SZ"]
 
 
 def normalize_date_series(series: pd.Series) -> pd.Series:
@@ -138,6 +139,16 @@ def download_or_load(
         raise ValueError(f"No data returned for {ticker}")
     df.to_csv(cache_path, index=False)
     return df
+
+
+def load_market_index(start: str, end: Optional[str], cache_dir: Path, no_download: bool) -> pd.DataFrame:
+    errors = []
+    for ticker in MARKET_INDEX_FALLBACKS:
+        try:
+            return download_or_load(ticker, start, end, cache_dir, no_download)
+        except Exception as exc:
+            errors.append(f"{ticker}: {exc}")
+    raise ValueError("No market index data returned. Tried " + " | ".join(errors))
 
 
 def rolling_percentile_last(series: pd.Series, window: int) -> pd.Series:
@@ -661,7 +672,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     valuations = load_valuation(args.valuation_csv)
-    market = download_or_load(MARKET_INDEX, args.start, args.end, cache_dir, args.no_download)
+    market = load_market_index(args.start, args.end, cache_dir, args.no_download)
     market = add_price_indicators(market)
 
     data_by_code = {}
@@ -771,7 +782,7 @@ def run_longhold_analysis(
     )
     cache_path = Path(cache_dir)
     valuations = load_valuation(valuation_csv)
-    market = download_or_load(MARKET_INDEX, start, end, cache_path, no_download)
+    market = load_market_index(start, end, cache_path, no_download)
     market = add_price_indicators(market)
 
     data_by_code = {}
