@@ -679,11 +679,9 @@ def run(args: argparse.Namespace) -> None:
     )
 
     valuations = load_valuation(args.valuation_csv)
-    try:
+    if args.use_market_filter:
         market = add_price_indicators(load_market_index(args.start, args.end, cache_dir, args.no_download))
-    except Exception:
-        if args.use_market_filter:
-            raise
+    else:
         market = pd.DataFrame()
 
     data_by_code = {}
@@ -793,11 +791,9 @@ def run_longhold_analysis(
     )
     cache_path = Path(cache_dir)
     valuations = load_valuation(valuation_csv)
-    try:
+    if use_market_filter:
         market = add_price_indicators(load_market_index(start, end, cache_path, no_download))
-    except Exception:
-        if use_market_filter:
-            raise
+    else:
         market = pd.DataFrame()
 
     data_by_code = {}

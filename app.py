@@ -515,7 +515,7 @@ def render_longhold_backtest():
             st.caption("已检测到仓库内置 valuation.csv，将自动使用真实 PE/PB 分位。")
         elif valuation_file is None:
             st.caption("未检测到 valuation.csv；不上传时将使用价格分位代理估值。")
-        use_market_filter = st.checkbox("启用沪深300大盘过滤", value=False)
+        use_market_filter = st.checkbox("启用沪深300大盘过滤（关闭时不拉取000300）", value=False)
 
     if st.button("运行龙头回测", type="primary", use_container_width=True):
         tmp_val_path = None
