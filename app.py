@@ -4,6 +4,7 @@ A股信号监控 & 回测  |  Streamlit Web App
 手机访问：局域网 http://你的IP:8501  或 部署到 Streamlit Cloud
 """
 import streamlit as st
+import importlib
 import io
 import yfinance as yf
 import pandas as pd
@@ -364,10 +365,10 @@ def make_cb_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
     fig.update_yaxes(gridcolor="#e8eaed", ticksuffix="%")
     return fig
 
-@st.cache_resource(show_spinner=False)
 def load_longhold_module():
-    from leader_longhold_backtest import LEADERS, run_longhold_analysis
-    return LEADERS, run_longhold_analysis
+    import leader_longhold_backtest
+    module = importlib.reload(leader_longhold_backtest)
+    return module.LEADERS, module.run_longhold_analysis, getattr(module, "STRATEGY_VERSION", "unknown")
 
 LEADER_CN_NAMES = {
     "600900": "长江电力",
@@ -471,7 +472,7 @@ def account_download_csv(account_df, cash):
 
 def render_longhold_backtest():
     try:
-        leaders, run_analysis = load_longhold_module()
+        leaders, run_analysis, strategy_version = load_longhold_module()
     except Exception as exc:
         st.error(
             "无法加载龙头长期回测模块。请确认 GitHub 仓库中包含 "
@@ -482,6 +483,7 @@ def render_longhold_backtest():
 
     st.title("🏛️ 龙头长期回测（回测基于月底操作数据）")
     st.caption("多因子择机买入 · 核心持有 · 极端估值/严重破位退出")
+    st.caption(f"策略模块版本：{strategy_version}")
 
     st.markdown("**股票池**")
     st.caption(" · ".join([f"{code} {leader_cn_name(code, name)}" for code, name in leaders.items()]))
@@ -544,7 +546,7 @@ def render_longhold_backtest():
                     valuation_extreme_pct=val_extreme,
                 )
             except Exception as exc:
-                st.error(f"回测失败：{exc}")
+                st.error(f"回测失败：{exc}（沪深300大盘过滤：{'开启' if use_market_filter else '关闭'}）")
                 st.stop()
         st.session_state["longhold_result"] = result
 

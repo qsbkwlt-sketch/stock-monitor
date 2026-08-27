@@ -56,6 +56,7 @@ LEADERS = {
 
 MARKET_INDEX = "000300.SS"
 MARKET_INDEX_FALLBACKS = ["000300.SS", "399300.SZ"]
+STRATEGY_VERSION = "2026-08-27-no-market-index-when-filter-off"
 
 
 def normalize_date_series(series: pd.Series) -> pd.Series:
