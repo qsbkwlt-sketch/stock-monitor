@@ -4,12 +4,15 @@ A股信号监控 & 回测  |  Streamlit Web App
 手机访问：局域网 http://你的IP:8501  或 部署到 Streamlit Cloud
 """
 import streamlit as st
+import io
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import zipfile
 from plotly.subplots import make_subplots
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 def normalize_date_series(series: pd.Series) -> pd.Series:
     dates = pd.to_datetime(series, errors="coerce")
@@ -29,7 +32,9 @@ st.set_page_config(
 
 # ─── 常用股票快捷按钮 ─────────────────────────────────────────────────────────
 PRESETS = [
-    ("紫金", "601899"), ("洛阳钼", "603993"), ("宁德", "300750"),
+    ("紫金矿业", "601899"),
+    ("洛阳钼业", "603993"),
+    ("宁德时代", "300750"),
 ]
 
 # ─── 代码 → Yahoo Ticker ─────────────────────────────────────────────────────
@@ -329,6 +334,28 @@ def make_longhold_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=0, line_dash="dash", line_color="#555")
     fig.update_layout(
         title="龙头长期策略权益曲线",
+        height=320, margin=dict(l=10, r=10, t=40, b=10),
+        plot_bgcolor="#ffffff", paper_bgcolor="#ffffff",
+        font_color="#202124", showlegend=False,
+    )
+    fig.update_xaxes(gridcolor="#e8eaed")
+    fig.update_yaxes(gridcolor="#e8eaed", ticksuffix="%")
+    return fig
+
+def make_cb_equity_chart(equity_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if equity_df is None or equity_df.empty:
+        return fig
+    plot_df = equity_df.copy()
+    plot_df["ret"] = (plot_df["equity"] / plot_df["equity"].iloc[0] - 1) * 100
+    fig.add_trace(go.Scatter(
+        x=plot_df["date"], y=plot_df["ret"], mode="lines",
+        line=dict(color="#1a73e8", width=2),
+        fill="tozeroy", fillcolor="rgba(26,115,232,0.08)",
+        name="策略收益%"))
+    fig.add_hline(y=0, line_dash="dash", line_color="#555")
+    fig.update_layout(
+        title="可转债多因子权益曲线",
         height=320, margin=dict(l=10, r=10, t=40, b=10),
         plot_bgcolor="#ffffff", paper_bgcolor="#ffffff",
         font_color="#202124", showlegend=False,
@@ -755,6 +782,260 @@ def render_longhold_backtest():
 
     st.caption("数据仅供参考 · 不构成投资建议 · 历史表现不代表未来收益")
 
+@st.cache_resource(show_spinner=False)
+def load_cb_modules():
+    import cb_multi_factor_selector as selector
+    import cb_factor_signal as signal
+    import cb_factor_backtest as backtest
+    return selector, signal, backtest
+
+def make_zip_bytes(paths: list[Path]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in paths:
+            if path.exists() and path.is_file():
+                zf.write(path, arcname=path.name)
+    return buffer.getvalue()
+
+def download_existing_file(path: Path, label: str, key: str) -> None:
+    if path.exists() and path.is_file():
+        st.download_button(
+            label,
+            data=path.read_bytes(),
+            file_name=path.name,
+            mime="text/csv",
+            key=key,
+            use_container_width=True,
+        )
+
+def save_uploaded_cb_snapshots(uploaded_files, upload_dir: Path) -> int:
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for uploaded in uploaded_files or []:
+        name = Path(uploaded.name).name
+        if not name.lower().endswith(".csv"):
+            continue
+        (upload_dir / name).write_bytes(uploaded.getvalue())
+        saved += 1
+    return saved
+
+def render_cb_factor_strategy():
+    try:
+        selector, signal_module, backtest_module = load_cb_modules()
+    except Exception as exc:
+        st.error("无法加载可转债多因子模块。请确认仓库包含 cb_multi_factor_selector.py、cb_factor_signal.py、cb_factor_backtest.py。")
+        st.exception(exc)
+        return
+
+    st.title("可转债多因子策略")
+    st.caption("持有封基式排序 · 双低/收益/流动性/规模/评级 · 两周轮动 + 每日风控")
+
+    scores_path = Path("cb_factor_output/cb_factor_scores.csv")
+    candidates_path = Path("cb_factor_output/cb_factor_candidates.csv")
+    today_score_path = Path("data_cache/convertible_bonds") / f"cb_factor_scores_{date.today().isoformat()}.csv"
+    today_jsl_path = Path("data_cache/convertible_bonds") / f"cb_jsl_{date.today().isoformat()}.csv"
+    today_redeem_path = Path("data_cache/convertible_bonds") / f"cb_redeem_jsl_{date.today().isoformat()}.csv"
+    uploaded_snapshot_dir = Path(".streamlit_tmp/cb_uploaded_snapshots")
+
+    with st.expander("参数", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            capital = st.number_input("策略资金（元）", min_value=10000.0, max_value=5000000.0, value=40000.0, step=5000.0)
+            positions = st.slider("目标持仓只数", 3, 20, 10)
+            top = st.slider("候选展示数量", 5, 50, 20)
+        with c2:
+            buy_rank = st.slider("买入排名线", 5, 50, 20)
+            sell_rank = st.slider("卖出排名线", 10, 100, 40)
+            rebalance_steps = st.slider("轮动间隔（交易快照数）", 5, 30, 10)
+        with c3:
+            max_price = st.number_input("最高价格过滤", min_value=105.0, max_value=180.0, value=130.0, step=5.0)
+            max_premium = st.number_input("最高转股溢价率(%)", min_value=10.0, max_value=100.0, value=35.0, step=5.0)
+            min_amount = st.number_input("最低成交额", min_value=0.0, max_value=100000.0, value=1000.0, step=500.0)
+        cookie = st.text_input("集思录 Cookie（可选，匿名数据可能不完整）", type="password")
+        refresh = st.checkbox("联网刷新今日快照", value=False)
+        uploaded_snapshots = st.file_uploader(
+            "上传历史快照CSV用于回测（可多选，文件名如 cb_factor_scores_2026-08-19.csv）",
+            type=["csv"],
+            accept_multiple_files=True,
+            key="cb_snapshot_upload",
+        )
+
+    if uploaded_snapshots:
+        saved_count = save_uploaded_cb_snapshots(uploaded_snapshots, uploaded_snapshot_dir)
+        if saved_count:
+            st.caption(f"已暂存 {saved_count} 份历史快照，本次回测会优先使用这些上传文件。")
+
+    selector_args = SimpleNamespace(
+        top=int(top),
+        cache_dir="data_cache/convertible_bonds",
+        output_dir="cb_factor_output",
+        refresh=bool(refresh),
+        cookie=cookie or None,
+        min_expected_rows=100,
+        min_price=95.0,
+        max_price=float(max_price),
+        min_premium=-20.0,
+        max_premium=float(max_premium),
+        min_remaining_size=1.0,
+        min_amount=float(min_amount),
+        min_remaining_years=0.5,
+        min_rating_score=0.0,
+        exclude_redeem=True,
+        exclude_st=True,
+        weights="",
+    )
+    signal_args = SimpleNamespace(
+        scores=str(scores_path),
+        holdings=None,
+        output_dir="cb_factor_signal_output",
+        capital=float(capital),
+        positions=int(positions),
+        buy_rank=float(buy_rank),
+        sell_rank=float(sell_rank),
+        hard_exit_price=135.0,
+        watch=10,
+    )
+    backtest_args = SimpleNamespace(
+        snapshot_glob=str(uploaded_snapshot_dir / "*.csv")
+        if uploaded_snapshots
+        else "data_cache/convertible_bonds/cb_factor_scores_*.csv",
+        output_dir="cb_factor_backtest_output",
+        initial_cash=float(capital),
+        positions=int(positions),
+        buy_rank=float(buy_rank),
+        sell_rank=float(sell_rank),
+        rebalance_steps=int(rebalance_steps),
+        hard_exit_price=135.0,
+        cost_rate=0.001,
+    )
+
+    c_run, c_bt = st.columns(2)
+    with c_run:
+        if st.button("生成今日可转债信号", type="primary", use_container_width=True):
+            with st.spinner("正在生成可转债候选和信号..."):
+                try:
+                    selector.run(selector_args)
+                    signal_module.run(signal_args)
+                    st.session_state["cb_signal_ready"] = True
+                except Exception as exc:
+                    st.error(f"生成失败：{exc}")
+                    st.stop()
+    with c_bt:
+        if st.button("运行历史回测", use_container_width=True):
+            with st.spinner("正在读取历史快照并回测..."):
+                try:
+                    summary, trades, equity = backtest_module.run_backtest(backtest_args)
+                    st.session_state["cb_backtest_result"] = (summary, trades, equity)
+                except Exception as exc:
+                    st.info(str(exc))
+
+    st.divider()
+    if scores_path.exists():
+        scores = pd.read_csv(scores_path, dtype={"code": str})
+        tradable = scores[scores["filter_reason"].fillna("") == ""].copy()
+        st.markdown("**最新候选池**")
+        show_cols = ["rank", "code", "name", "price", "premium_rate", "double_low", "ytm", "remaining_size", "amount", "rating", "stock_name", "redeem_status", "score"]
+        st.dataframe(
+            tradable[[col for col in show_cols if col in tradable.columns]].head(int(top)),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if len(scores) < 100:
+            st.warning("当前快照行数偏少，可能是集思录匿名访问受限。填写 Cookie 后刷新可获得更完整债池。")
+
+        st.markdown("**下载数据**")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            download_existing_file(today_score_path, "下载今日打分快照", "download_cb_today_score")
+        with d2:
+            download_existing_file(scores_path, "下载最新评分表", "download_cb_latest_scores")
+        with d3:
+            zip_paths = [
+                today_score_path,
+                today_jsl_path,
+                today_redeem_path,
+                scores_path,
+                candidates_path,
+                Path("cb_factor_signal_output/cb_daily_signals.csv"),
+                Path("cb_factor_signal_output/cb_target_portfolio.csv"),
+            ]
+            zip_data = make_zip_bytes(zip_paths)
+            if zip_data:
+                st.download_button(
+                    "下载今日CSV包",
+                    data=zip_data,
+                    file_name=f"cb_factor_{date.today().isoformat()}.zip",
+                    mime="application/zip",
+                    key="download_cb_zip",
+                    use_container_width=True,
+                )
+    else:
+        st.info("还没有可转债快照。点击“生成今日可转债信号”先生成候选池。")
+
+    signals_path = Path("cb_factor_signal_output/cb_daily_signals.csv")
+    target_path = Path("cb_factor_signal_output/cb_target_portfolio.csv")
+    if signals_path.exists():
+        st.markdown("**今日轮动目标**")
+        signals = pd.read_csv(signals_path, dtype={"code": str})
+        st.dataframe(signals, use_container_width=True, hide_index=True)
+        download_existing_file(signals_path, "下载今日轮动目标CSV", "download_cb_signals")
+    if target_path.exists():
+        with st.expander("目标组合", expanded=False):
+            target = pd.read_csv(target_path, dtype={"code": str})
+            st.dataframe(target, use_container_width=True, hide_index=True)
+            download_existing_file(target_path, "下载目标组合CSV", "download_cb_target")
+
+    result = st.session_state.get("cb_backtest_result")
+    if result:
+        summary, trades, equity = result
+        st.divider()
+        st.markdown("**历史回测**")
+        s = summary.iloc[0]
+        m1, m2, m3, m4 = st.columns(4)
+        for col, label, value in [
+            (m1, "累计收益", f"{s['total_return_pct']:.2f}%"),
+            (m2, "年化收益", f"{s['cagr_pct']:.2f}%"),
+            (m3, "最大回撤", f"{s['max_drawdown_pct']:.2f}%"),
+            (m4, "胜率", f"{s['win_rate_pct']:.1f}%"),
+        ]:
+            col.markdown(f"""<div class="metric-box">
+                <div style="font-size:10px;color:#888">{label}</div>
+                <div style="color:#202124;font-weight:700;font-size:16px">{value}</div>
+            </div>""", unsafe_allow_html=True)
+        st.plotly_chart(make_cb_equity_chart(equity), use_container_width=True)
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            st.download_button(
+                "下载回测汇总CSV",
+                data=summary.to_csv(index=False).encode("utf-8-sig"),
+                file_name="cb_factor_backtest_summary.csv",
+                mime="text/csv",
+                key="download_cb_bt_summary",
+                use_container_width=True,
+            )
+        with b2:
+            st.download_button(
+                "下载回测交易CSV",
+                data=trades.to_csv(index=False).encode("utf-8-sig"),
+                file_name="cb_factor_backtest_trades.csv",
+                mime="text/csv",
+                key="download_cb_bt_trades",
+                use_container_width=True,
+            )
+        with b3:
+            st.download_button(
+                "下载权益曲线CSV",
+                data=equity.to_csv(index=False).encode("utf-8-sig"),
+                file_name="cb_factor_backtest_equity.csv",
+                mime="text/csv",
+                key="download_cb_bt_equity",
+                use_container_width=True,
+            )
+        with st.expander("回测交易明细", expanded=False):
+            st.dataframe(trades, use_container_width=True, hide_index=True)
+
+    st.caption("AKShare/集思录适合每日快照沉淀；完整历史回测建议后续导入 Tushare/RiceQuant 全市场历史因子。数据仅供参考，不构成投资建议。")
+
 SIGNAL_TEXT_MAP = {
     "market_weak": "大盘偏弱",
     "long_trend_up": "长期趋势向上",
@@ -816,9 +1097,12 @@ st.markdown("""
 st.title("📈 A股信号监控")
 st.caption(f"数据来源：Yahoo Finance · T-1日线 · {date.today()}")
 
-view = st.radio("视图", ["单股信号监控", "龙头长期回测"], horizontal=True, label_visibility="collapsed")
+view = st.radio("视图", ["单股信号监控", "龙头长期回测", "可转债多因子"], horizontal=True, label_visibility="collapsed")
 if view == "龙头长期回测":
     render_longhold_backtest()
+    st.stop()
+if view == "可转债多因子":
+    render_cb_factor_strategy()
     st.stop()
 
 # 交易窗口状态
