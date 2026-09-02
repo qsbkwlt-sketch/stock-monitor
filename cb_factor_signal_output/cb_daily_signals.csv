@@ -1,5 +1,4 @@
 snapshot_date,action,reason,code,name,price,rank,shares,market_value,pnl_pct,filter_reason
-2026-09-01,BUY,ranked_entry,127061,美锦转债,114.96,1.0,34.795,4000.0,,
-2026-09-01,BUY,ranked_entry,113056,重银转债,127.841,2.0,31.289,4000.0,,
-2026-09-01,BUY,ranked_entry,127030,盛虹转债,119.942,3.0,33.349,4000.0,,
-2026-09-01,BUY,ranked_entry,113062,常银转债,129.203,4.0,30.959,4000.0,,
+2026-09-02,BUY,ranked_entry,127061,美锦转债,113.125,1.0,35.359,4000.0,,
+2026-09-02,BUY,ranked_entry,113056,重银转债,127.083,2.0,31.475,4000.0,,
+2026-09-02,BUY,ranked_entry,113062,常银转债,128.812,3.0,31.053,4000.0,,
